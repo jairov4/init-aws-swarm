@@ -1,186 +1,122 @@
 #!/bin/bash
-# Based on docker4x/init-aws
+set -e
 
-export PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-export INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-export REGION=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
-export NODE_TYPE=$(aws ec2 describe-tags --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=swarm-node-type" --region $REGION --output=json | jq -r .Tags[0].Value)
+SWARM_PORT=2377
+MAX_TRIES=10
 
+REGION=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+export AWS_DEFAULT_REGION="$REGION"
+PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+NODE_TYPE=$(aws ec2 describe-tags --filters \
+  "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=swarm-node-type" | jq -r .Tags[0].Value)
+
+# Poor man's Debugger
 echo "DYNAMODB_TABLE=$DYNAMODB_TABLE"
+echo "NODE_TYPE=$NODE_TYPE"
+echo "INSTANCE_ID=$INSTANCE_ID"
+echo "PRIVATE_IP=$PRIVATE_IP"
 
-get_swarm_id()
-{
-    if [ "$NODE_TYPE" == "manager" ] ; then
-        export SWARM_ID=$(docker info | grep ClusterID | cut -f2 -d: | sed -e 's/^[ \t]*//')
-    fi
-    echo "SWARM_ID: $SWARM_ID"
+# Validation
+if [[ -z "$NODE_TYPE" ]]; then
+  echo "No node type"
+  exit 92
+fi
+
+if [[ -z "$DYNAMODB_TABLE" ]]; then
+  echo "No DynamoDB table configured"
+  exit 93
+fi
+
+managers() { aws ec2 describe-instances --filters \
+  'Name=tag:swarm-node-type,Values=manager' 'Name=instance-state-name,Values=running' |
+  jq -r '.Reservations[] | .Instances[] | .PrivateIpAddress'; }
+manager_token() { aws dynamodb get-item --table-name "$DYNAMODB_TABLE" \
+  --key '{"id":{"S": "manager_token"}}' | jq -r '.Item.value.S'; }
+worker_token() { aws dynamodb get-item --table-name "$DYNAMODB_TABLE" \
+  --key '{"id":{"S": "worker_token"}}' | jq -r '.Item.value.S'; }
+
+swarm_state() { docker info | grep Swarm | cut -f2 -d: | sed -e 's/^[ \t]*//'; }
+swarm_id() { docker info | grep ClusterID | cut -f2 -d: | sed -e 's/^[ \t]*//'; }
+node_id() { docker info | grep NodeID | cut -f2 -d: | sed -e 's/^[ \t]*//'; }
+swarm_is_active() { [[ "$(swarm_state)" == active ]]; }
+swarm_token() { ([[ "$NODE_TYPE" == manager ]] && manager_token) || worker_token; }
+delete_token() {
+  aws dynamodb delete-item --table-name "$DYNAMODB_TABLE" --key manager_token \
+    --condition-expression 'attribute_exists(id)'
+  aws dynamodb delete-item --table-name "$DYNAMODB_TABLE" --key worker_token \
+    --condition-expression 'attribute_exists(id)'
 }
 
-get_node_id()
-{
-    export NODE_ID=$(docker info | grep NodeID | cut -f2 -d: | sed -e 's/^[ \t]*//')
-    echo "NODE: $NODE_ID"
+join() {
+  TOKEN="$(swarm_token)"
+  [[ -n "$TOKEN" ]] || return 1
+  for MANAGER_IP in $MANAGERS; do
+    [[ "$MANAGER_IP" != "$PRIVATE_IP" ]] || continue
+    echo "Joining to $MANAGER_IP"
+    docker swarm leave --force || echo "Left previous swarm"
+    docker swarm join --token "$TOKEN" \
+      --listen-addr "$PRIVATE_IP:$SWARM_PORT" \
+      --advertise-addr "$PRIVATE_IP:$SWARM_PORT" \
+      "$MANAGER_IP:$SWARM_PORT" || echo "Waiting to see if swarm goes up"
+    local N=0
+    until swarm_is_active || ((N == MAX_TRIES)); do
+      ((N += 1))
+      echo "Sleeping for 30 secs"
+      sleep 10
+    done
+    if swarm_is_active; then return 0; fi
+  done
+  return 1
 }
 
-function get_primary_manager_ip {
-  echo "Get Primary Manager IP"
-  # Query dynamodb and get the private IP for the primary manager if it exists.
-  export MANAGER_IP=$(aws dynamodb get-item --region $REGION --table-name $DYNAMODB_TABLE --key '{"id":{"S": "primary_manager"}}' | jq -r '.Item.value.S')
-  echo "MANAGER_IP=$MANAGER_IP"
-}
+new_cluster() {
+  [[ "$NODE_TYPE" == manager ]] || return 1
+  if [[ -z "$(swarm_token)" ]] || delete_token; then
+    echo "Initializing new cluster"
+    docker swarm leave --force || echo "Left previous swarm"
+    docker swarm init \
+      --listen-addr "$PRIVATE_IP:$SWARM_PORT" \
+      --advertise-addr "$PRIVATE_IP:$SWARM_PORT"
 
-get_manager_token()
-{
-    export MANAGER_TOKEN=$(aws dynamodb get-item --region $REGION --table-name $DYNAMODB_TABLE --key '{"id":{"S": "manager_join_token"}}' | jq -r '.Item.value.S')
-}
+    # Get the join tokens and add them to dynamodb
+    MANAGER_TOKEN=$(docker swarm join-token manager | grep token | awk '{ print $5 }')
+    WORKER_TOKEN=$(docker swarm join-token worker | grep token | awk '{ print $5 }')
 
-get_worker_token()
-{
-  export WORKER_TOKEN=$(aws dynamodb get-item --region $REGION --table-name $DYNAMODB_TABLE --key '{"id":{"S": "worker_join_token"}}' | jq -r '.Item.value.S')
-}
-
-create_node_id_tag()
-{
-  get_node_id
-  aws ec2 create-tags --resource $INSTANCE_ID --tags Key=node-id,Value=$NODE_ID --region $REGION
-}
-
-function join_as_secondary_manager {
- # We are not the primary manager, so join as secondary manager.
- n=0
- until [ $n -gt 5 ]
- do
-     docker swarm join --token $MANAGER_TOKEN --listen-addr $PRIVATE_IP:2377 --advertise-addr $PRIVATE_IP:2377 $MANAGER_IP:2377
-     get_swarm_id
-
-     # check if we have a SWARM_ID, if so, we were able to join, if not, it failed.
-     if [ -z "$SWARM_ID" ]; then
-         echo "Can't connect to primary manager, sleep and try again"
-         sleep 60
-         n=$[$n+1]
-
-         # if we are pending, we might have hit the primary when it was shutting down.
-         # we should leave the swarm, and try again, after getting the new primary ip.
-         SWARM_STATE=$(docker info | grep Swarm | cut -f2 -d: | sed -e 's/^[ \t]*//')
-         echo "SWARM_STATE=$SWARM_STATE"
-         if [ "$SWARM_STATE" == "pending" ] ; then
-             echo "Swarm state is pending, something happened, lets reset, and try again."
-             docker swarm leave --force
-             sleep 30
-         fi
-         # query dynamodb again, incase the manager changed
-         get_primary_manager_ip
-         get_manager_token
-     else
-         echo "Connected to primary manager, SWARM_ID=$SWARM_ID"
-         break
-     fi
- done
-}
-
-function setup_manager {
-  echo "Setting up swarm manager"
-  if [ -z "$MANAGER_IP" ]; then
-    echo "Create Primary Manager"
-    # try to write to the table as the primary_manager, if it succeeds then it is the first
-    # and it is the primary manager. If it fails, then it isn't first, and treat the record
-    # that is there, as the primary manager, and join that swarm.
+    echo "Storing tokens"
     aws dynamodb put-item \
-        --table-name $DYNAMODB_TABLE \
-        --region $REGION \
-        --item '{"id":{"S": "primary_manager"},"value": {"S":"'"$PRIVATE_IP"'"}}' \
-        --condition-expression 'attribute_not_exists(id)'
-
-    RESULT=$?
-    echo "Result of DynamoDB PUT=$RESULT"
-
-    if [ $RESULT -eq "0" ]; then
-      echo "Initialising Swarm Cluster"
-      # we are the primary, so init the cluster
-      docker swarm init --listen-addr $PRIVATE_IP:2377 --advertise-addr $PRIVATE_IP:2377
-
-      # Get the join tokens and add them to dynamodb
-      export MANAGER_TOKEN=$(docker swarm join-token manager | grep token | awk '{ print $5 }')
-      export WORKER_TOKEN=$(docker swarm join-token worker | grep token | awk '{ print $5 }')
-
-      aws dynamodb put-item \
-          --table-name $DYNAMODB_TABLE \
-          --region $REGION \
-          --item '{"id":{"S": "manager_join_token"},"value": {"S":"'"$MANAGER_TOKEN"'"}}'
-
-      aws dynamodb put-item \
-          --table-name $DYNAMODB_TABLE \
-          --region $REGION \
-          --item '{"id":{"S": "worker_join_token"},"value": {"S":"'"$WORKER_TOKEN"'"}}'
-    else
-      echo "Another node became primary manager before us, lets join as a secondary manager"
-      join_as_secondary_manager
-    fi
-  elif [ "$PRIVATE_IP" == "$MANAGER_IP" ]; then
-      echo "We are already the leader, maybe it we restarted?"
-      SWARM_STATE=$(docker info | grep Swarm | cut -f2 -d: | sed -e 's/^[ \t]*//')
-      # should be active, pending or inactive
-      echo "Swarm State = $SWARM_STATE"
+      --table-name "$DYNAMODB_TABLE" \
+      --item '{"id":{"S": "manager_token"},"value": {"S":"'"$MANAGER_TOKEN"'"}}' \
+      --condition-expression 'attribute_not_exists(id)'
+    aws dynamodb put-item \
+        --table-name "$DYNAMODB_TABLE" \
+        --item '{"id":{"S": "worker_token"},"value": {"S":"'"$WORKER_TOKEN"'"}}'
   else
-      echo "Joining the cluster as secondary manager"
-      join_as_secondary_manager
+    echo 'Other manager is initializing new cluster'
+    return 1
   fi
 }
 
-function setup_worker {
-  # We are a worker, so we join the cluster as one
-  n=0
-  until [ $n -gt 5 ]
-  do
-      docker swarm join --token $WORKER_TOKEN --listen-addr $PRIVATE_IP:2377 --advertise-addr $PRIVATE_IP:2377 $MANAGER_IP:2377
-      get_node_id
-
-      # check if we have a NODE_ID, if so, we were able to join, if not, it failed.
-      if [ -z "$NODE_ID" ]; then
-          echo "Can't connect to primary manager, sleep and try again"
-          sleep 60
-          n=$[$n+1]
-
-          # if we are pending, we might have hit the primary when it was shutting down.
-          # we should leave the swarm, and try again, after getting the new primary ip.
-          SWARM_STATE=$(docker info | grep Swarm | cut -f2 -d: | sed -e 's/^[ \t]*//')
-          echo "SWARM_STATE=$SWARM_STATE"
-          if [ "$SWARM_STATE" == "pending" ] ; then
-              echo "Swarm state is pending, something happened, lets reset, and try again."
-              docker swarm leave --force
-              sleep 30
-          fi
-          # query dynamodb again, incase the manager changed
-          get_primary_manager_ip
-          get_worker_token
-      else
-          echo "Connected to primary manager, NODE_ID=$NODE_ID"
-          break
-      fi
-  done
+finish() {
+  echo "Show current status"
+  docker info
+  echo "Create tags for current instance"
+  aws ec2 create-tags --resource "$INSTANCE_ID" --tags \
+    "Key=swarm-node-id,Value=$(node_id)" "Key=swarm-id,Value=$(swarm_id)"
 }
 
-# Check if the primary manager ip exists
-get_primary_manager_ip
-
-# if it is a manager, setup as manager, if not, setup as worker node.
-if [ "$NODE_TYPE" == "manager" ] ; then
-    echo "Manager node, running manager setup"
-    get_manager_token
-    setup_manager
-else
-    echo "Worker node, running worker setup"
-    get_worker_token
-    setup_worker
-fi
-
-get_swarm_id
-get_node_id
-
-if [ -z "$NODE_ID" ] && [ -z "$SWARM_ID" ]; then
-  echo "Failed to create or join the swarm cluster"
+main() {
+  local N=0
+  until ((N == MAX_TRIES)); do
+    ((N += 1))
+    echo "Round $N"
+    if join || new_cluster; then
+      finish
+      exit 0
+    fi
+    sleep 10
+  done
   exit 1
-fi
+}
 
-# Add the node id as the tag
-create_node_id_tag
+main
