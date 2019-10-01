@@ -1,4 +1,4 @@
-FROM amazonlinux:latest
+FROM amazonlinux:1
 MAINTAINER Bhavik Kumar <bhavik@depost.pro>
 
 RUN yum update -y
