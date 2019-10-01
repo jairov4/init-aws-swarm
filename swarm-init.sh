@@ -42,9 +42,9 @@ node_id() { docker info | grep NodeID | cut -f2 -d: | sed -e 's/^[ \t]*//'; }
 swarm_is_active() { [[ "$(swarm_state)" == active ]]; }
 swarm_token() { ([[ "$NODE_TYPE" == manager ]] && manager_token) || worker_token; }
 delete_token() {
-  aws dynamodb delete-item --table-name "$DYNAMODB_TABLE" --key manager_token \
+  aws dynamodb delete-item --table-name "$DYNAMODB_TABLE" --key '{"id":{"S": "manager_token"}}' \
     --condition-expression 'attribute_exists(id)'
-  aws dynamodb delete-item --table-name "$DYNAMODB_TABLE" --key worker_token \
+  aws dynamodb delete-item --table-name "$DYNAMODB_TABLE" --key '{"id":{"S": "worker_token"}}' \
     --condition-expression 'attribute_exists(id)'
 }
 
