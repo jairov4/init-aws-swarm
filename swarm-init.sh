@@ -51,7 +51,7 @@ delete_token() {
 join() {
   TOKEN="$(swarm_token)"
   [[ -n "$TOKEN" ]] || return 1
-  for MANAGER_IP in $MANAGERS; do
+  for MANAGER_IP in $(managers); do
     [[ "$MANAGER_IP" != "$PRIVATE_IP" ]] || continue
     echo "Joining to $MANAGER_IP"
     docker swarm leave --force || echo "Left previous swarm"
