@@ -1,6 +1,4 @@
 #!/bin/bash
-set -e
-
 SWARM_PORT=2377
 MAX_TRIES=10
 
@@ -87,8 +85,8 @@ new_cluster() {
     aws dynamodb put-item \
       --table-name "$DYNAMODB_TABLE" \
       --item '{"id":{"S": "manager_token"},"value": {"S":"'"$MANAGER_TOKEN"'"}}' \
-      --condition-expression 'attribute_not_exists(id)'
-    aws dynamodb put-item \
+      --condition-expression 'attribute_not_exists(id)' \
+    && aws dynamodb put-item \
         --table-name "$DYNAMODB_TABLE" \
         --item '{"id":{"S": "worker_token"},"value": {"S":"'"$WORKER_TOKEN"'"}}'
   else
